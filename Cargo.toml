@@ -1,0 +1,12 @@
+[package]
+name = "audiowhisper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.15"
+hound = "3.5"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "multipart", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
