@@ -1,6 +1,5 @@
 use std::io::Cursor;
 use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -17,38 +16,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("No input device available");
     let config = device.default_input_config()?;
     
-    // For simplicity, we require I16 sample format.
-    if config.sample_format() != cpal::SampleFormat::I16 {
-        eprintln!("This example currently only supports I16 sample format");
-        return Ok(());
-    }
-    
     let sample_rate = config.sample_rate().0 as usize;
     let channels = config.channels() as usize;
     
     println!("Input device: {}", device.name()?);
     println!(
-        "Using sample rate: {} Hz, channels: {}",
-        sample_rate, channels
+        "Using sample rate: {} Hz, channels: {}, sample format: {:?}",
+        sample_rate,
+        channels,
+        config.sample_format()
     );
     
-    // Create an MPSC channel to move audio samples from the capture callback to our processing loop.
+    // Create an MPSC channel to pass audio samples (as i16) from the capture callback.
     let (tx, rx) = mpsc::channel::<Vec<i16>>();
     
-    // Build the input stream. The callback sends incoming samples to our channel.
-    let stream = device.build_input_stream(
-        &config.into(),
-        move |data: &[i16], _| {
-            // Copy the slice into a Vec and send it.
-            let samples = data.to_vec();
-            // Ignore errors if the receiver is dropped.
-            let _ = tx.send(samples);
-        },
-        move |err| {
-            eprintln!("Audio stream error: {}", err);
-        },
-        None,
-    )?;
+    // Error callback.
+    let err_fn = |err| {
+        eprintln!("Audio stream error: {}", err);
+    };
+    
+    // Build the input stream based on the device's sample format.
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::I16 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[i16], _| {
+                    // Directly pass the i16 samples.
+                    let samples = data.to_vec();
+                    let _ = tx.send(samples);
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::F32 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[f32], _| {
+                    // Convert each f32 sample to i16.
+                    let samples: Vec<i16> =
+                        data.iter().map(|&s| cpal::Sample::from_sample(s)).collect();
+                    let _ = tx.send(samples);
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            device.build_input_stream(
+                &config.into(),
+                move |data: &[u16], _| {
+                    // Convert each u16 sample to i16.
+                    let samples: Vec<i16> =
+                        data.iter().map(|&s| cpal::Sample::from_sample(s)).collect();
+                    let _ = tx.send(samples);
+                },
+                err_fn,
+                None,
+            )?
+        }
+        _ => {
+            eprintln!("Unsupported sample format");
+            return Ok(());
+        }
+    };
     
     stream.play()?;
     println!("Audio stream started. Recording and processing in chunks...");
@@ -67,22 +98,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Main processing loop.
     loop {
-        // Block for a short duration waiting for new audio samples.
+        // Block briefly waiting for new audio samples.
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(samples) => {
                 audio_buffer.extend(samples);
-                // Once we have enough samples, process the chunk.
+                // When we have enough samples, process the chunk.
                 if audio_buffer.len() >= samples_per_chunk {
                     // Extract one chunk.
                     let chunk: Vec<i16> = audio_buffer.drain(..samples_per_chunk).collect();
                     println!("Processing a chunk ({} samples)...", chunk.len());
                     
-                    // Create an in-memory WAV file from the samples.
+                    // Create an in‑memory WAV file from the chunk.
                     let wav_data = create_wav_in_memory(&chunk, channels as u16, sample_rate as u32)?;
                     
                     // Clone API key for the async task.
                     let api_key_clone = api_key.clone();
-                    // Spawn an async task to send the chunk without blocking audio capture.
+                    // Spawn an async task to send the chunk to the Whisper API.
                     tokio::spawn(async move {
                         match send_audio_chunk(wav_data, &api_key_clone).await {
                             Ok(transcription) => {
@@ -95,10 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // No new audio in this interval; continue looping.
-                continue;
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -106,13 +134,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Create an in‑memory WAV file (as a Vec<u8>) from a slice of i16 samples.
+/// Create an in‑memory WAV file (as Vec<u8>) from a slice of i16 samples.
 fn create_wav_in_memory(
     samples: &[i16],
     channels: u16,
     sample_rate: u32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // We use a Cursor over a Vec<u8> as the output.
+    // Use a Cursor over a Vec<u8> as the output.
     let mut buffer = Cursor::new(Vec::<u8>::new());
     let spec = hound::WavSpec {
         channels,
