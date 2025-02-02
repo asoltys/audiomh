@@ -1,11 +1,32 @@
-use std::io::Cursor;
+use std::fs::OpenOptions;
+use std::io::{Cursor, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound;
 use reqwest::multipart;
-use tokio;
+
+/// Compute the RMS (root-mean-square) energy of a block of i16 samples.
+fn compute_rms(samples: &[i16]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|&s| (s as f64).powi(2)).sum();
+    (sum_sq / samples.len() as f64).sqrt()
+}
+
+/// Write a transcription to the FIFO so goose can read it.
+fn write_to_fifo(transcription: &str) {
+    // Attempt to open the FIFO for writing. This will block if no reader is attached.
+    if let Ok(mut fifo) = OpenOptions::new().write(true).open("/tmp/goose_pipe") {
+        if let Err(e) = writeln!(fifo, "{}", transcription) {
+            eprintln!("Error writing to FIFO: {}", e);
+        }
+    } else {
+        eprintln!("Could not open FIFO /tmp/goose_pipe for writing");
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,10 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .default_input_device()
         .expect("No input device available");
     let config = device.default_input_config()?;
-    
     let sample_rate = config.sample_rate().0 as usize;
     let channels = config.channels() as usize;
-    
+
     println!("Input device: {}", device.name()?);
     println!(
         "Using sample rate: {} Hz, channels: {}, sample format: {:?}",
@@ -26,24 +46,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         channels,
         config.sample_format()
     );
-    
-    // Create an MPSC channel to pass audio samples (as i16) from the capture callback.
-    let (tx, rx) = mpsc::channel::<Vec<i16>>();
-    
-    // Error callback.
+
+    // Create an MPSC channel to receive audio sample blocks (converted to i16).
+    let (audio_tx, rx) = mpsc::channel::<Vec<i16>>();
     let err_fn = |err| {
         eprintln!("Audio stream error: {}", err);
     };
-    
-    // Build the input stream based on the device's sample format.
+
     let stream = match config.sample_format() {
         cpal::SampleFormat::I16 => {
             device.build_input_stream(
                 &config.into(),
                 move |data: &[i16], _| {
-                    // Directly pass the i16 samples.
                     let samples = data.to_vec();
-                    let _ = tx.send(samples);
+                    let _ = audio_tx.send(samples);
                 },
                 err_fn,
                 None,
@@ -53,10 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             device.build_input_stream(
                 &config.into(),
                 move |data: &[f32], _| {
-                    // Convert each f32 sample to i16.
                     let samples: Vec<i16> =
                         data.iter().map(|&s| cpal::Sample::from_sample(s)).collect();
-                    let _ = tx.send(samples);
+                    let _ = audio_tx.send(samples);
                 },
                 err_fn,
                 None,
@@ -66,10 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             device.build_input_stream(
                 &config.into(),
                 move |data: &[u16], _| {
-                    // Convert each u16 sample to i16.
                     let samples: Vec<i16> =
                         data.iter().map(|&s| cpal::Sample::from_sample(s)).collect();
-                    let _ = tx.send(samples);
+                    let _ = audio_tx.send(samples);
                 },
                 err_fn,
                 None,
@@ -80,67 +94,174 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
-    
+
     stream.play()?;
-    println!("Audio stream started. Recording and processing in chunks...");
-    
-    // Determine how many samples to capture per chunk.
-    // For example, capture 3 seconds of audio.
-    let chunk_duration_secs = 3;
-    let samples_per_chunk = sample_rate * chunk_duration_secs * channels;
-    
-    // Buffer to accumulate samples.
-    let mut audio_buffer: Vec<i16> = Vec::with_capacity(samples_per_chunk);
-    
-    // Retrieve the API key from the environment.
+    println!("Audio stream started. Using adaptive chunking...");
+
+    // Adaptive chunking parameters.
+    let energy_threshold = 300.0; // Adjust based on your microphone sensitivity.
+    let min_speech_duration_secs = 0.5; // Minimum duration for a valid segment.
+    let silence_duration_secs = 0.3;    // Duration of sustained silence to mark the end.
+    let max_chunk_duration_secs = 10.0; // Maximum duration before forcing a flush.
+    let min_speech_samples = (sample_rate as f64 * channels as f64 * min_speech_duration_secs) as usize;
+    let silence_duration_samples = (sample_rate as f64 * channels as f64 * silence_duration_secs) as usize;
+    let max_chunk_samples = (sample_rate as f64 * channels as f64 * max_chunk_duration_secs) as usize;
+    // For a 100 ms period, the number of samples.
+    let silence_increment = (sample_rate as f64 * channels as f64 * 0.1) as usize;
+
     let api_key = std::env::var("OPENAI_API_KEY")
         .expect("Please set the OPENAI_API_KEY environment variable");
-    
-    // Main processing loop.
+
+    // Adaptive chunking state.
+    let mut in_speech = false;
+    let mut current_chunk: Vec<i16> = Vec::new();
+    let mut silence_samples = 0;
+
     loop {
-        // Block briefly waiting for new audio samples.
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(samples) => {
-                audio_buffer.extend(samples);
-                // When we have enough samples, process the chunk.
-                if audio_buffer.len() >= samples_per_chunk {
-                    // Extract one chunk.
-                    let chunk: Vec<i16> = audio_buffer.drain(..samples_per_chunk).collect();
-                    println!("Processing a chunk ({} samples)...", chunk.len());
-                    
-                    // Create an in‑memory WAV file from the chunk.
-                    let wav_data = create_wav_in_memory(&chunk, channels as u16, sample_rate as u32)?;
-                    
-                    // Clone API key for the async task.
-                    let api_key_clone = api_key.clone();
-                    // Spawn an async task to send the chunk to the Whisper API.
-                    tokio::spawn(async move {
-                        match send_audio_chunk(wav_data, &api_key_clone).await {
-                            Ok(transcription) => {
-                                println!("Transcription: {}", transcription);
-                            }
-                            Err(e) => {
-                                eprintln!("Error sending audio chunk: {}", e);
-                            }
+            Ok(block) => {
+                let rms = compute_rms(&block);
+                if !in_speech {
+                    if rms >= energy_threshold {
+                        in_speech = true;
+                        silence_samples = 0;
+                        current_chunk.extend(block);
+                    }
+                } else {
+                    current_chunk.extend(&block);
+                    if rms < energy_threshold {
+                        silence_samples += block.len();
+                    } else {
+                        silence_samples = 0;
+                    }
+                    // End the segment if enough silence is detected.
+                    if silence_samples >= silence_duration_samples {
+                        if current_chunk.len() >= min_speech_samples {
+                            println!("Finalizing chunk ({} samples)", current_chunk.len());
+                            let wav_data = match create_wav_in_memory(
+                                &current_chunk,
+                                channels as u16,
+                                sample_rate as u32,
+                            ) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    eprintln!("Error creating WAV in memory: {}", e);
+                                    current_chunk.clear();
+                                    in_speech = false;
+                                    silence_samples = 0;
+                                    continue;
+                                }
+                            };
+                            let api_key_clone = api_key.clone();
+                            tokio::spawn(async move {
+                                match send_audio_chunk(wav_data, &api_key_clone).await {
+                                    Ok(transcription) => {
+                                        println!("Transcription: {}", transcription);
+                                        if let Some(filtered) = filter_transcription(&transcription) {
+                                            write_to_fifo(&filtered);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error sending audio chunk: {}", e);
+                                    }
+                                }
+                            });
                         }
-                    });
+                        current_chunk.clear();
+                        in_speech = false;
+                        silence_samples = 0;
+                    }
+                    // Flush if the chunk becomes too long.
+                    if current_chunk.len() >= max_chunk_samples {
+                        println!("Finalizing long chunk ({} samples)", current_chunk.len());
+                        let wav_data = match create_wav_in_memory(
+                            &current_chunk,
+                            channels as u16,
+                            sample_rate as u32,
+                        ) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                eprintln!("Error creating WAV in memory: {}", e);
+                                current_chunk.clear();
+                                in_speech = false;
+                                silence_samples = 0;
+                                continue;
+                            }
+                        };
+                        let api_key_clone = api_key.clone();
+                        tokio::spawn(async move {
+                            match send_audio_chunk(wav_data, &api_key_clone).await {
+                                Ok(transcription) => {
+                                    println!("Transcription: {}", transcription);
+                                    if let Some(filtered) = filter_transcription(&transcription) {
+                                        write_to_fifo(&filtered);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Error sending audio chunk: {}", e);
+                                }
+                            }
+                        });
+                        current_chunk.clear();
+                        in_speech = false;
+                        silence_samples = 0;
+                    }
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if in_speech {
+                    silence_samples += silence_increment;
+                    if silence_samples >= silence_duration_samples {
+                        if current_chunk.len() >= min_speech_samples {
+                            println!("Finalizing chunk after timeout ({} samples)", current_chunk.len());
+                            let wav_data = match create_wav_in_memory(
+                                &current_chunk,
+                                channels as u16,
+                                sample_rate as u32,
+                            ) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    eprintln!("Error creating WAV in memory: {}", e);
+                                    current_chunk.clear();
+                                    in_speech = false;
+                                    silence_samples = 0;
+                                    continue;
+                                }
+                            };
+                            let api_key_clone = api_key.clone();
+                            tokio::spawn(async move {
+                                match send_audio_chunk(wav_data, &api_key_clone).await {
+                                    Ok(transcription) => {
+                                        println!("Transcription: {}", transcription);
+                                        if let Some(filtered) = filter_transcription(&transcription) {
+                                            write_to_fifo(&filtered);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error sending audio chunk: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        current_chunk.clear();
+                        in_speech = false;
+                        silence_samples = 0;
+                    }
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    
+
     Ok(())
 }
 
-/// Create an in‑memory WAV file (as Vec<u8>) from a slice of i16 samples.
+/// Create an in‑memory WAV file (as a Vec<u8>) from a slice of i16 samples.
 fn create_wav_in_memory(
     samples: &[i16],
     channels: u16,
     sample_rate: u32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // Use a Cursor over a Vec<u8> as the output.
     let mut buffer = Cursor::new(Vec::<u8>::new());
     let spec = hound::WavSpec {
         channels,
@@ -162,7 +283,6 @@ async fn send_audio_chunk(
     api_key: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    // Build a multipart form with the audio file and required parameters.
     let form = multipart::Form::new()
         .part(
             "file",
@@ -171,18 +291,40 @@ async fn send_audio_chunk(
                 .mime_str("audio/wav")?,
         )
         .text("model", "whisper-1");
-    
     let response = client
         .post("https://api.openai.com/v1/audio/transcriptions")
         .bearer_auth(api_key)
         .multipart(form)
         .send()
         .await?;
-    
-    // Parse the JSON response.
     let json: serde_json::Value = response.json().await?;
-    // The transcription text should be in the "text" field.
     let transcription = json["text"].as_str().unwrap_or("").to_string();
-    
     Ok(transcription)
+}
+
+/// Filter transcriptions aggressively.
+/// Discards transcriptions that are too short, match unwanted phrases, or consist mostly of non-alphabetic characters.
+fn filter_transcription(transcription: &str) -> Option<String> {
+    let unwanted = [
+        "Thank you for watching!",
+        "Thank you for watching",
+        "ご視聴ありがとうございました",
+        "ご視聴ありがとうございました。",
+        "¡Gracias por ver!",
+        "시청해주셔서 감사합니다",
+        "시청해주셔서 감사합니다!",
+    ];
+    let trimmed = transcription.trim();
+    if trimmed.is_empty() || trimmed.len() < 3 {
+        return None;
+    }
+    if trimmed.chars().all(|c| !c.is_alphabetic()) {
+        return None;
+    }
+    for phrase in &unwanted {
+        if trimmed.eq_ignore_ascii_case(phrase) {
+            return None;
+        }
+    }
+    Some(trimmed.to_string())
 }
